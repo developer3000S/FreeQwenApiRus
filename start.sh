@@ -33,7 +33,7 @@ fi
 
 # 3. Запуск системы
 echo "Запуск FreQwenAPI ..."
-npm run auth
+# npm run auth
 npm run models:sync
 SKIP_ACCOUNT_MENU=true npm start
 
