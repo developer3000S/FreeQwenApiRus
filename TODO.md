@@ -1,10 +1,13 @@
-# TODO — Исправление ошибки `Runtime.callFunctionOn timed out` / `protocolTimeout`
+# TODO — Исправление зависания запроса /api/chat/completions
 
-## Шаги
+## Задача
+Запрос к `/api/chat/completions` (stream:false) зависает бесконечно.
+Причина: браузерные fetch-вызовы к Qwen API не имеют гарантированных таймаутов
+(AbortController), установленных ДО начала `fetch`.
 
-- [x] 1. `src/api/chat.js` — добавить browser-side `AbortController` таймаут в in-page `fetch` в `executeApiRequest` (браузерный путь).
-- [x] 2. `src/api/chat.js` — использовать существующий `evaluateWithProtocolGuard` для обёртки сырых `page.evaluate` вызовов.
-- [x] 3. `src/api/chat.js` — в `catch` в `sendMessage` определять protocol-timeout ошибки и возвращать чистый retryable ответ.
-- [x] 4. `src/api/fileUpload.js` — добавить browser-side `AbortController` таймаут в `getStsToken` и `uploadFile`.
-- [x] 5. `.env.example` — задокументировать `PROTOCOL_TIMEOUT`, `BROWSER_FETCH_TIMEOUT`, `QWEN_USE_NODE_FETCH` (документация добавлена в `README.md`).
-- [x] 6. Прогнать тесты `node --test tests/*.test.js` (60/60 прошли).
+## План
+- [x] 1. Browser-версия `executeApiRequest`: установить overallTimer и armIdleTimer() ДО `await fetch(...)`.
+- [x] 2. `createChatV2`: добавить AbortController + таймаут перед `fetch`.
+- [x] 3. `testToken`: добавить AbortController + таймаут перед `fetch`.
+- [x] 4. `pollTaskStatus` (браузерный fetch): добавить таймаут (AbortController).
+- [x] 5. Проверить изменения (логотипы/редактура) и запустить smoke-тест (npm test — 60/60 успешно).

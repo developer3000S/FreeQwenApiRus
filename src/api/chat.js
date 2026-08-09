@@ -281,6 +281,11 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
             const statusUrl = `${TASK_STATUS_URL}/${taskId}`;
 
 const result = await evaluateWithProtocolGuard(page, async (data) => {
+                const controller = new AbortController();
+                const timeoutMs = getBrowserFetchTimeoutMs();
+                const overallTimer = setTimeout(() => {
+                    controller.abort(new Error(`Task-status fetch timed out after ${timeoutMs}ms`));
+                }, timeoutMs);
                 try {
                     const response = await fetch(data.url, {
                         method: 'GET',
@@ -288,14 +293,18 @@ const result = await evaluateWithProtocolGuard(page, async (data) => {
                         headers: {
                             'Authorization': `Bearer ${data.token}`,
                             'Accept': 'application/json'
-                        }
+                        },
+                        signal: controller.signal
                     });
                     if (!response.ok) {
                         return { success: false, status: response.status, error: await response.text() };
                     }
                     return { success: true, data: await response.json() };
                 } catch (e) {
-                    return { success: false, error: e.toString() };
+                    const timedOut = controller.signal.aborted || /timed out|aborted/i.test(String(e?.message || e));
+                    return { success: false, status: timedOut ? 408 : undefined, error: timedOut ? `Task-status fetch timed out: ${e?.message || e}` : e.toString() };
+                } finally {
+                    clearTimeout(overallTimer);
                 }
             }, { url: statusUrl, token, credentials });
 
@@ -1040,7 +1049,15 @@ const browserTimeoutMs = getBrowserFetchTimeoutMs();
             }, data.idleTimeoutMs);
         };
 
-        try {
+try {
+            // Таймауты должны быть установлены ДО fetch, чтобы гарантированно
+            // прервать запрос даже при зависшем соединении (когда сам fetch не
+            // возвращает управление). Иначе запрос может висеть бесконечно.
+            overallTimer = setTimeout(() => {
+                controller.abort(new Error(`Browser fetch timed out after ${data.timeoutMs}ms`));
+            }, data.timeoutMs);
+            armIdleTimer();
+
             const response = await fetch(data.apiUrl, {
                 method: 'POST',
                 credentials: data.credentials,
@@ -1049,10 +1066,6 @@ const browserTimeoutMs = getBrowserFetchTimeoutMs();
                 signal: controller.signal
             });
             armIdleTimer();
-
-            overallTimer = setTimeout(() => {
-                controller.abort(new Error(`Browser fetch timed out after ${data.timeoutMs}ms`));
-            }, data.timeoutMs);
 
             if (response.ok) {
                 if (data.payload.stream === false) {
@@ -1690,17 +1703,30 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         };
 
 const result = await evaluateWithProtocolGuard(page, async (data) => {
+            const controller = new AbortController();
+            const timeoutMs = getBrowserFetchTimeoutMs();
+            const overallTimer = setTimeout(() => {
+                controller.abort(new Error(`Create-chat fetch timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
             try {
                 const response = await fetch(data.apiUrl, {
                     method: 'POST',
                     credentials: data.credentials,
                     headers: data.headers,
-                    body: JSON.stringify(data.payload)
+                    body: JSON.stringify(data.payload),
+                    signal: controller.signal
                 });
                 if (response.ok) return { success: true, data: await response.json() };
                 return { success: false, status: response.status, errorBody: await response.text() };
             } catch (error) {
-                return { success: false, error: error.toString() };
+                const timedOut = controller.signal.aborted || /timed out|aborted/i.test(String(error?.message || error));
+                return {
+                    success: false,
+                    status: timedOut ? 408 : undefined,
+                    error: timedOut ? `Create-chat fetch timed out: ${error?.message || error}` : error.toString()
+                };
+            } finally {
+                clearTimeout(overallTimer);
             }
         }, requestBody);
 
@@ -1796,16 +1822,25 @@ export async function testToken(token) {
         };
 
 const result = await evaluateWithProtocolGuard(page, async (data) => {
+            const controller = new AbortController();
+            const timeoutMs = getBrowserFetchTimeoutMs();
+            const overallTimer = setTimeout(() => {
+                controller.abort(new Error(`testToken fetch timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
             try {
                 const res = await fetch(data.apiUrl, {
                     method: 'POST',
                     credentials: data.credentials,
                     headers: data.headers,
-                    body: JSON.stringify(data.payload)
+                    body: JSON.stringify(data.payload),
+                    signal: controller.signal
                 });
                 return { ok: res.ok, status: res.status };
             } catch (e) {
-                return { ok: false, status: 0, error: e.toString() };
+                const timedOut = controller.signal.aborted || /timed out|aborted/i.test(String(e?.message || e));
+                return { ok: false, status: timedOut ? 408 : 0, error: timedOut ? `testToken timed out: ${e?.message || e}` : e.toString() };
+            } finally {
+                clearTimeout(overallTimer);
             }
         }, requestBody);
 
