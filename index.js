@@ -10,11 +10,13 @@ import { logHttpRequest, logInfo, logError, logWarn } from './src/logger/index.j
 import { prompt } from './src/utils/prompt.js';
 import { FORGETMEAI_WATERMARK } from './src/utils/branding.js';
 import { PORT, HOST } from './src/config.js';
+import { isBrowserOriginAllowed, normalizeOrigin, parseAllowedOrigins } from './src/api/originPolicy.js';
 
 const app = express();
 
 const port = Number.parseInt(process.env.PORT ?? PORT, 10);
 const host = process.env.HOST || HOST;
+const allowedBrowserOrigins = parseAllowedOrigins(process.env.CORS_ORIGINS);
 
 if (Number.isNaN(port) || port <= 0 || port > 65535) {
     throw new Error(`Некорректное значение переменной PORT: ${process.env.PORT}`);
@@ -42,6 +44,19 @@ function ensureNonInteractiveTokens() {
     logInfo(`Автоматический запуск: обнаружено ${tokens.length} аккаунтов, из них ${validTokens.length} активны.`);
 }
 
+app.use((req, res, next) => {
+    const requestOrigin = req.headers.origin;
+    res.header('Vary', 'Origin');
+    if (!isBrowserOriginAllowed(requestOrigin, allowedBrowserOrigins)) {
+        return res.status(403).json({ error: 'Browser origin is not allowed', type: 'cors_error' });
+    }
+    if (requestOrigin) res.header('Access-Control-Allow-Origin', normalizeOrigin(requestOrigin));
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
 app.use(logHttpRequest);
 app.use(bodyParser.json({ limit: '150mb' }));
 app.use(bodyParser.urlencoded({ limit: '150mb', extended: true }));
@@ -58,14 +73,6 @@ app.use((err, req, res, next) => {
     }
 
     return next(err);
-});
-
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
 });
 
 app.use('/api', apiRoutes);

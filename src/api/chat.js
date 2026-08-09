@@ -2,7 +2,18 @@ import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus } f
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken } from './tokenManager.js';
+import {
+    getAvailableToken,
+    getAvailableTokenById,
+    hasValidTokens,
+    markInvalidByToken,
+    markRateLimitedByToken
+} from './tokenManager.js';
+import {
+    createAccountAffinityRegistry,
+    resolveChatRequestContext,
+    snapshotAccountToken
+} from './accountAffinity.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -21,12 +32,104 @@ const __dirname = path.dirname(__filename);
 const MODELS_FILE = path.join(__dirname, '..', 'AvailableModels.txt');
 const AUTH_KEYS_FILE = path.join(__dirname, '..', 'Authorization.txt');
 
-let authToken = null;
+let browserAuthToken = null;
 let availableModels = null;
 let authKeys = null;
-let browserTokenRateLimited = false;
+let browserTokenCooldown = null;
+const resourceAccountAffinity = createAccountAffinityRegistry();
+const chatAccountAffinity = Object.freeze({
+    get: chatId => resourceAccountAffinity.get(buildAffinityKey('chat', chatId)),
+    forget: chatId => resourceAccountAffinity.forget(buildAffinityKey('chat', chatId))
+});
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isBrowserAccountId(accountId) {
+    return typeof accountId === 'string' && accountId.startsWith('browser:');
+}
+
+export function getManagedAccountId(storedAccountId) {
+    if (storedAccountId === null || storedAccountId === undefined) return null;
+    const normalized = String(storedAccountId).trim();
+    return normalized ? `managed:${encodeURIComponent(normalized)}` : null;
+}
+
+function getStoredManagedAccountId(accountId) {
+    if (typeof accountId !== 'string' || !accountId.startsWith('managed:')) return null;
+    try {
+        return decodeURIComponent(accountId.slice('managed:'.length)) || null;
+    } catch {
+        return null;
+    }
+}
+
+function snapshotManagedToken(tokenObj) {
+    const managedId = getManagedAccountId(tokenObj?.id);
+    return snapshotAccountToken({ id: managedId, token: tokenObj?.token });
+}
+
+export function getBrowserFetchCredentials(accountId) {
+    return isBrowserAccountId(accountId) ? 'same-origin' : 'omit';
+}
+
+function snapshotBrowserToken(token) {
+    if (typeof token !== 'string' || !token) return null;
+    const fingerprint = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
+    return snapshotAccountToken({ id: `browser:${fingerprint}`, token });
+}
+
+function tokenFingerprint(token) {
+    return typeof token === 'string' && token
+        ? crypto.createHash('sha256').update(token).digest('hex')
+        : null;
+}
+
+export function createBrowserTokenCooldown(token, hours = 24, now = Date.now()) {
+    const fingerprint = tokenFingerprint(token);
+    if (!fingerprint) return null;
+    const normalizedHours = Number.isFinite(Number(hours)) && Number(hours) > 0 ? Number(hours) : 24;
+    return Object.freeze({
+        fingerprint,
+        resetAt: now + normalizedHours * 60 * 60 * 1000
+    });
+}
+
+export function isBrowserTokenCooldownActive(cooldown, token, now = Date.now()) {
+    if (!cooldown || cooldown.fingerprint !== tokenFingerprint(token)) return false;
+    return Number(cooldown.resetAt) > now;
+}
+
+function browserTokenIsRateLimited(token, now = Date.now()) {
+    if (!browserTokenCooldown) return false;
+    if (!isBrowserTokenCooldownActive(browserTokenCooldown, token, now)) {
+        browserTokenCooldown = null;
+        return false;
+    }
+    return true;
+}
+
+function markBrowserTokenRateLimited(token, hours) {
+    browserTokenCooldown = createBrowserTokenCooldown(token, hours);
+}
+
+export async function hasAlternativeAccount(
+    currentTokenObj,
+    { hasManagedAccount, resolveBrowserAccount }
+) {
+    if (typeof hasManagedAccount !== 'function' || typeof resolveBrowserAccount !== 'function') {
+        throw new TypeError('hasManagedAccount and resolveBrowserAccount are required');
+    }
+    if (hasManagedAccount()) return true;
+    const browserTokenObj = snapshotAccountToken(await resolveBrowserAccount());
+    return Boolean(browserTokenObj) && browserTokenObj.token !== currentTokenObj?.token;
+}
+
+async function canRetryWithAnotherAccount(currentTokenObj, browserContext) {
+    return hasAlternativeAccount(currentTokenObj, {
+        hasManagedAccount: hasValidTokens,
+        resolveBrowserAccount: () => resolveBrowserToken(browserContext)
+    });
+}
 
 function asciiTimezone(date = new Date()) {
     return date.toString().replace(/[\u0080-\uFFFF]/g, '');
@@ -122,12 +225,12 @@ export const pagePool = {
         const newPage = await getPage(context);
         await newPage.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
 
-        if (!authToken) {
+        if (!browserAuthToken) {
             try {
-                authToken = await newPage.evaluate(() => localStorage.getItem('token'));
+                browserAuthToken = await newPage.evaluate(() => localStorage.getItem('token'));
                 logInfo('Токен авторизации получен из браузера');
-                if (authToken) {
-                    saveAuthToken(authToken);
+                if (browserAuthToken) {
+                    saveAuthToken(browserAuthToken);
                 }
             } catch (e) {
                 logError('Ошибка при получении токена авторизации', e);
@@ -169,7 +272,7 @@ export const pagePool = {
 
 // ─── Task polling ────────────────────────────────────────────────────────────
 
-export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POLL_MAX_ATTEMPTS, interval = TASK_POLL_INTERVAL) {
+export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POLL_MAX_ATTEMPTS, interval = TASK_POLL_INTERVAL, credentials = 'omit') {
     logInfo(`Начинаем опрос статуса задачи: ${taskId}`);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -180,6 +283,7 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
                 try {
                     const response = await fetch(data.url, {
                         method: 'GET',
+                        credentials: data.credentials,
                         headers: {
                             'Authorization': `Bearer ${data.token}`,
                             'Accept': 'application/json'
@@ -192,7 +296,7 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
                 } catch (e) {
                     return { success: false, error: e.toString() };
                 }
-            }, { url: statusUrl, token });
+            }, { url: statusUrl, token, credentials });
 
             if (!result.success) {
                 logWarn(`Ошибка при проверке статуса (попытка ${attempt}/${maxAttempts}): ${result.error}`);
@@ -228,7 +332,7 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
 // ─── Token extraction ────────────────────────────────────────────────────────
 
 export async function extractAuthToken(context, forceRefresh = false) {
-    if (authToken && !forceRefresh) return authToken;
+    if (browserAuthToken && !forceRefresh) return browserAuthToken;
 
     try {
         const page = await getPage(context);
@@ -258,10 +362,10 @@ export async function extractAuthToken(context, forceRefresh = false) {
             if (shouldClosePage) await page.close();
 
             if (newToken) {
-                authToken = newToken;
+                browserAuthToken = newToken;
                 logInfo('Токен авторизации успешно извлечен');
-                saveAuthToken(authToken);
-                return authToken;
+                saveAuthToken(browserAuthToken);
+                return browserAuthToken;
             }
             logError('Токен авторизации не найден в браузере');
             return null;
@@ -360,31 +464,184 @@ function validateAndPrepareMessage(message) {
     return { error: 'Неподдерживаемый формат сообщения' };
 }
 
-async function resolveAuthToken(browserContext) {
-    const tokenObj = await getAvailableToken();
-    if (tokenObj && tokenObj.token) {
-        authToken = tokenObj.token;
-        logInfo(`Используется аккаунт: ${tokenObj.id}`);
-        return tokenObj;
-    }
-
-    if (browserTokenRateLimited) {
-        logWarn('Browser-токен залимичен, пропускаем fallback');
-        return null;
-    }
-
+async function resolveBrowserToken(browserContext) {
+    if (!browserContext) return null;
     if (!getAuthenticationStatus()) {
         logInfo('Проверка авторизации...');
         const authCheck = await checkAuthentication(browserContext);
         if (!authCheck) return null;
     }
 
-    if (!authToken) {
+    let token = browserAuthToken;
+    if (token && browserTokenIsRateLimited(token)) {
+        // A relogin can replace the browser token before the finite cooldown
+        // expires. Refresh once so a new fingerprint is immediately usable.
+        token = await extractAuthToken(browserContext, true);
+    }
+    if (!token) {
         logInfo('Получение токена авторизации...');
-        authToken = await extractAuthToken(browserContext);
+        token = await extractAuthToken(browserContext);
+    }
+    if (!token) return null;
+    if (browserTokenIsRateLimited(token)) {
+        logWarn('Browser-токен временно залимичен, пропускаем fallback');
+        return null;
+    }
+    return snapshotBrowserToken(token);
+}
+
+async function resolveAuthToken(browserContext) {
+    const tokenObj = snapshotManagedToken(await getAvailableToken());
+    if (tokenObj) {
+        logInfo(`Используется аккаунт: ${tokenObj.id}`);
+        return tokenObj;
     }
 
-    return authToken ? { id: 'browser', token: authToken } : null;
+    return resolveBrowserToken(browserContext);
+}
+
+export async function selectRequestAccount(browserContext = getBrowserContext()) {
+    if (!browserContext) return null;
+    return resolveAuthToken(browserContext);
+}
+
+async function resolveAccountToken(accountId, browserContext) {
+    if (isBrowserAccountId(accountId)) {
+        const tokenObj = await resolveBrowserToken(browserContext);
+        return tokenObj?.id === accountId ? tokenObj : null;
+    }
+    const storedAccountId = getStoredManagedAccountId(accountId);
+    return storedAccountId ? snapshotManagedToken(getAvailableTokenById(storedAccountId)) : null;
+}
+
+function buildAffinityKey(resourceType, resourceId, clientScope = null) {
+    if (!resourceType || resourceId === null || resourceId === undefined) return null;
+    const normalizedId = String(resourceId).trim();
+    if (!normalizedId) return null;
+    if (resourceType === 'file' || resourceType === 'task') {
+        const normalizedScope = clientScope === null || clientScope === undefined
+            ? 'unscoped'
+            : String(clientScope).trim();
+        if (!normalizedScope) return null;
+        return `${resourceType}:${normalizedScope}:${normalizedId}`;
+    }
+    return `${resourceType}:${normalizedId}`;
+}
+
+export function bindResourceToAccount(resourceType, resourceId, accountId, clientScope = null) {
+    const affinityKey = buildAffinityKey(resourceType, resourceId, clientScope);
+    if (!affinityKey || !accountId) return false;
+    const bound = resourceAccountAffinity.bind(affinityKey, accountId);
+    if (!bound) {
+        logWarn(`Ресурс ${resourceType}:${resourceId} уже закреплён за другим аккаунтом; привязка отклонена`);
+    }
+    return bound;
+}
+
+export function getResourceAccountId(resourceType, resourceId, clientScope = null) {
+    return resourceAccountAffinity.get(buildAffinityKey(resourceType, resourceId, clientScope));
+}
+
+export function collectFileResourceIds(files) {
+    if (!Array.isArray(files)) return [];
+    const ids = new Set();
+    const keys = new Set(['id', 'file', 'input_file', 'file_id', 'fileId', 'file_path', 'filePath', 'file_url', 'url']);
+    const seen = new WeakSet();
+
+    function collect(value) {
+        if (typeof value === 'string' && value.trim()) {
+            ids.add(value.trim());
+            return;
+        }
+        if (!value || typeof value !== 'object' || seen.has(value)) return;
+        seen.add(value);
+        if (Array.isArray(value)) {
+            for (const item of value) collect(item);
+            return;
+        }
+        for (const [key, child] of Object.entries(value)) {
+            if (keys.has(key)) collect(child);
+        }
+    }
+
+    for (const file of files) {
+        collect(file);
+    }
+    return [...ids];
+}
+
+export function collectEmbeddedFileReferences(value) {
+    const references = [];
+    const seen = new WeakSet();
+    const fileKeys = new Set(['file', 'input_file', 'file_id', 'fileId', 'file_path', 'filePath', 'file_url']);
+
+    function visit(item) {
+        if (!item || typeof item !== 'object' || seen.has(item)) return;
+        seen.add(item);
+        if (Array.isArray(item)) {
+            for (const child of item) visit(child);
+            return;
+        }
+
+        const type = typeof item.type === 'string' ? item.type.toLowerCase() : '';
+        if (type === 'file' || type === 'input_file' || Object.keys(item).some(key => fileKeys.has(key))) {
+            references.push(item);
+        }
+        for (const child of Object.values(item)) visit(child);
+    }
+
+    visit(value);
+    return references;
+}
+
+export function resolveFileAccountId(files, clientScope = null) {
+    const resourceIds = collectFileResourceIds(files);
+    const accountIds = new Set();
+    const hasFiles = Array.isArray(files) && files.length > 0;
+    let allFilesHaveKnownOwner = hasFiles && resourceIds.length > 0;
+
+    for (const resourceId of resourceIds) {
+        const accountId = getResourceAccountId('file', resourceId, clientScope);
+        if (!accountId) {
+            allFilesHaveKnownOwner = false;
+            continue;
+        }
+        accountIds.add(accountId);
+    }
+    if (accountIds.size > 1) {
+        return { error: 'Файлы принадлежат разным Qwen-аккаунтам; загрузите их заново одним аккаунтом.' };
+    }
+    return {
+        accountId: accountIds.values().next().value || null,
+        hasFiles,
+        hasKnownOwner: accountIds.size === 1 && allFilesHaveKnownOwner,
+        resourceIds
+    };
+}
+
+export function preflightFileRequest(messageContent, files = null, clientScope = null) {
+    if (files !== null && files !== undefined && !Array.isArray(files)) {
+        return {
+            error: 'Поле files должно быть массивом. Запрос с вложениями отклонён до выбора Qwen-аккаунта.',
+            status: 400,
+            invalidRequest: true
+        };
+    }
+
+    const embeddedFiles = collectEmbeddedFileReferences(messageContent);
+    const affinityFiles = [...(files || []), ...embeddedFiles];
+    const fileAffinity = resolveFileAccountId(affinityFiles, clientScope);
+    if (fileAffinity.error) {
+        return { error: fileAffinity.error, status: 409, reuploadRequired: true };
+    }
+    if (fileAffinity.hasFiles && !fileAffinity.hasKnownOwner) {
+        return {
+            error: 'Не удалось определить Qwen-аккаунт прикреплённых файлов. Загрузите файлы заново перед отправкой.',
+            status: 409,
+            reuploadRequired: true
+        };
+    }
+    return { fileAffinity };
 }
 
 function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null) {
@@ -505,7 +762,13 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
         if (!response.ok) {
             const errorBody = await response.text();
-            return { success: false, status: response.status, statusText: response.statusText, errorBody };
+            return {
+                success: false,
+                status: response.status,
+                statusText: response.statusText,
+                errorBody,
+                antiBot: isQwenAntiBotBody(errorBody)
+            };
         }
 
         if (payload.stream === false) {
@@ -616,18 +879,22 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
     }
 }
 
-async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
+export function shouldReturnNodeStreamingResponse(streamedResponse, preferNodeFetch = false) {
+    if (streamedResponse?.hasStreamedChunks === true) return true;
+    if (streamedResponse?.antiBot) return Boolean(preferNodeFetch);
+    return Boolean(
+        streamedResponse?.success ||
+        streamedResponse?.status ||
+        streamedResponse?.errorBody
+    );
+}
+
+async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, credentials = 'omit') {
     const preferNodeFetch = String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === '1' || String(process.env.QWEN_USE_NODE_FETCH || '').toLowerCase() === 'true';
     if (payload?.stream !== false && (typeof onChunk === 'function' || preferNodeFetch)) {
         const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk);
 
-        const canReturnDirectly =
-            streamedResponse.success ||
-            Boolean(streamedResponse.status) ||
-            (Boolean(streamedResponse.errorBody) && !streamedResponse.antiBot) ||
-            streamedResponse.hasStreamedChunks === true;
-
-        if (canReturnDirectly || (preferNodeFetch && streamedResponse.antiBot)) {
+        if (shouldReturnNodeStreamingResponse(streamedResponse, preferNodeFetch)) {
             return streamedResponse;
         }
 
@@ -637,7 +904,8 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
     const requestBody = {
         apiUrl: buildQwenCompletionUrl(apiUrl, payload?.chat_id),
         payload,
-        headers: buildQwenRequestHeaders(token)
+        headers: buildQwenRequestHeaders(token),
+        credentials
     };
 
     logDebug(`Используем токен: ${token ? 'Токен существует' : 'Токен отсутствует'}`);
@@ -647,6 +915,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
         try {
             const response = await fetch(data.apiUrl, {
                 method: 'POST',
+                credentials: data.credentials,
                 headers: data.headers,
                 body: JSON.stringify(data.payload)
             });
@@ -768,16 +1037,60 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
     }, requestBody);
 }
 
-async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null) {
+export function buildAccountSwitchRetryArgs(requestContext = {}) {
+    const {
+        message,
+        model,
+        files = null,
+        tools = null,
+        toolChoice = null,
+        systemMessage = null,
+        chatType = 't2t',
+        size = null,
+        waitForCompletion = true,
+        retryCount = 0,
+        onChunk = null,
+        resetMessage = null,
+        clientScope = null
+    } = requestContext;
+
+    return [
+        message,
+        model,
+        null,
+        null,
+        files,
+        tools,
+        toolChoice,
+        systemMessage,
+        chatType,
+        size,
+        waitForCompletion,
+        retryCount + 1,
+        onChunk,
+        resetMessage,
+        clientScope
+    ];
+}
+
+export async function retryAfterAccountSwitch(requestContext, sendMessageFn) {
+    if (typeof sendMessageFn !== 'function') {
+        throw new TypeError('sendMessageFn must be a function');
+    }
+    return sendMessageFn(...buildAccountSwitchRetryArgs(requestContext));
+}
+
+async function handleApiError(response, tokenObj, requestContext) {
+    const { chatId, retryCount, fileAccountId } = requestContext;
     logRaw(JSON.stringify(response));
-    logError(`Ошибка при получении ответа: ${response.error || response.statusText}`);
+    logError(`Ошибка при получении ответа: ${response.error || response.statusText || `HTTP ${response.status || 'unknown'}`}`);
     if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
 
     if (response.html && response.html.includes('Verification')) {
         setAuthenticationStatus(false);
         logInfo('Обнаружена необходимость верификации, перезапуск браузера в видимом режиме...');
         await pagePool.clear();
-        authToken = null;
+        browserAuthToken = null;
         await shutdownBrowser();
         await initBrowser(true);
         return { error: 'Требуется верификация. Браузер запущен в видимом режиме.', verification: true, chatId };
@@ -785,15 +1098,30 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
         logWarn(`Токен ${tokenObj?.id} недействителен (401). Удаляем и пробуем другой.`);
-        authToken = null;
-        browserTokenRateLimited = false;
-        if (tokenObj?.id && tokenObj.id !== 'browser') {
-            const { markInvalid } = await import('./tokenManager.js');
-            markInvalid(tokenObj.id);
+        chatAccountAffinity.forget(chatId);
+        markInvalidByToken(tokenObj?.token);
+        if (isBrowserAccountId(tokenObj?.id) || browserAuthToken === tokenObj?.token) {
+            browserAuthToken = null;
+            setAuthenticationStatus(false);
         }
-        const { hasValidTokens } = await import('./tokenManager.js');
-        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+        if (response.hasStreamedChunks) {
+            return {
+                error: 'Поток прерван из-за смены аккаунта; повторите запрос, чтобы начать новый чат.',
+                partial: true,
+                chatId
+            };
+        }
+        if (fileAccountId) {
+            return {
+                error: 'Аккаунт, которому принадлежат прикреплённые файлы, недоступен. Загрузите файлы заново перед повтором.',
+                chatId,
+                fileAccountId,
+                reuploadRequired: true
+            };
+        }
+        if (retryCount < MAX_RETRY_COUNT && await canRetryWithAnotherAccount(tokenObj, requestContext.browserContext)) {
+            logInfo('Пересоздаем чат под следующим доступным аккаунтом после ошибки авторизации');
+            return retryAfterAccountSwitch(requestContext, sendMessage);
         }
         logError('Не осталось валидных токенов или исчерпаны попытки.');
         return { error: 'Все токены недействительны (401). Требуется повторная авторизация.', chatId };
@@ -803,21 +1131,37 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         let hours = 24;
         try {
             const rateInfo = JSON.parse(response.errorBody);
-            hours = Number(rateInfo.num) || 24;
+            const parsedHours = Number(rateInfo.num);
+            hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : 24;
         } catch { /* errorBody might not be valid JSON */ }
 
-        if (tokenObj?.id === 'browser') {
-            browserTokenRateLimited = true;
+        markRateLimitedByToken(tokenObj?.token, hours);
+        if (isBrowserAccountId(tokenObj?.id) || browserAuthToken === tokenObj?.token) {
+            markBrowserTokenRateLimited(tokenObj?.token, hours);
             logWarn(`Browser-токен достиг лимита. Помечаем на ${hours}ч.`);
         } else if (tokenObj?.id) {
-            markRateLimited(tokenObj.id, hours);
             logWarn(`Токен ${tokenObj.id} достиг лимита. Помечаем на ${hours}ч и пробуем другой токен...`);
         }
 
-        authToken = null;
-        const { hasValidTokens } = await import('./tokenManager.js');
-        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+        chatAccountAffinity.forget(chatId);
+        if (response.hasStreamedChunks) {
+            return {
+                error: 'Поток прерван из-за лимита аккаунта; повторите запрос, чтобы начать новый чат.',
+                partial: true,
+                chatId
+            };
+        }
+        if (fileAccountId) {
+            return {
+                error: 'Аккаунт прикреплённых файлов достиг лимита. Загрузите файлы заново, чтобы использовать другой аккаунт.',
+                chatId,
+                fileAccountId,
+                reuploadRequired: true
+            };
+        }
+        if (retryCount < MAX_RETRY_COUNT && await canRetryWithAnotherAccount(tokenObj, requestContext.browserContext)) {
+            logInfo('Пересоздаем чат под следующим доступным аккаунтом после rate limit');
+            return retryAfterAccountSwitch(requestContext, sendMessage);
         }
         return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
     }
@@ -827,28 +1171,18 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
 // ─── Main public API ─────────────────────────────────────────────────────────
 
-export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null) {
+export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, resetMessage = null, clientScope = null) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
-
-    const browserContext = getBrowserContext();
-    if (!browserContext) return { error: 'Браузер не инициализирован', chatId };
-
-    const tokenObj = await resolveAuthToken(browserContext);
-    if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
-
-    if (!chatId) {
-        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, tokenObj);
-        if (newChatResult.error) return { error: 'Не удалось создать чат: ' + newChatResult.error };
-        chatId = newChatResult.chatId;
-        logInfo(`Создан новый чат v2 с ID: ${chatId}`);
-    }
 
     const validated = validateAndPrepareMessage(message);
     if (validated.error) {
         logError(validated.error);
-        return { error: validated.error, chatId };
+        return { error: validated.error, status: 400, invalidRequest: true, chatId };
     }
-    const messageContent = validated.content;
+    let messageContent = validated.content;
+
+    const filePreflight = preflightFileRequest(messageContent, files, clientScope);
+    if (filePreflight.error) return { ...filePreflight, chatId };
 
     if (!model || model.trim() === '') {
         model = DEFAULT_MODEL;
@@ -862,6 +1196,96 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         logInfo(`Тип генерации: ${chatType} (${typeLabels[chatType] || chatType})${size ? `, размер: ${size}` : ''}`);
     }
 
+    const browserContext = getBrowserContext();
+    if (!browserContext) return { error: 'Браузер не инициализирован', chatId };
+
+    const { fileAffinity } = filePreflight;
+
+    let fileTokenObj = null;
+    if (fileAffinity.accountId) {
+        const chatAccountId = getResourceAccountId('chat', chatId);
+        if (chatAccountId && chatAccountId !== fileAffinity.accountId) {
+            return {
+                error: 'Чат и прикреплённые файлы принадлежат разным Qwen-аккаунтам. Создайте новый чат или загрузите файлы заново.',
+                status: 409,
+                chatId,
+                reuploadRequired: true
+            };
+        }
+        fileTokenObj = await resolveAccountToken(fileAffinity.accountId, browserContext);
+        if (!fileTokenObj) {
+            return {
+                error: 'Аккаунт прикреплённых файлов недоступен. Загрузите файлы заново перед отправкой.',
+                status: 409,
+                chatId,
+                reuploadRequired: true
+            };
+        }
+    }
+
+    const accountContext = await resolveChatRequestContext({
+        chatId,
+        parentId,
+        affinityRegistry: chatAccountAffinity,
+        getAccountToken: accountId => resolveAccountToken(accountId, browserContext),
+        selectToken: () => fileTokenObj || resolveAuthToken(browserContext)
+    });
+    if (!accountContext) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
+
+    if (accountContext.resetReason) {
+        logWarn(`Чат ${chatId} не будет переиспользован (${accountContext.resetReason}); создаём новый чат под выбранным аккаунтом`);
+    }
+
+    if ((accountContext.resetReason || retryCount > 0) && resetMessage !== null) {
+        const resetValidated = validateAndPrepareMessage(resetMessage);
+        if (resetValidated.error) {
+            return {
+                error: `Некорректный резервный контекст: ${resetValidated.error}`,
+                status: 400,
+                invalidRequest: true,
+                chatId
+            };
+        }
+        messageContent = resetValidated.content;
+        logInfo('Контекст клиента свёрнут в один запрос после создания нового Qwen-чата');
+    }
+
+    chatId = accountContext.chatId;
+    parentId = accountContext.parentId;
+    const tokenObj = Object.freeze({ id: accountContext.accountId, token: accountContext.token });
+    const retryContext = {
+        message,
+        model,
+        chatId,
+        parentId,
+        files,
+        tools,
+        toolChoice,
+        systemMessage,
+        retryCount,
+        chatType,
+        size,
+        waitForCompletion,
+        onChunk,
+        resetMessage,
+        fileAccountId: fileAffinity.accountId,
+        browserContext,
+        clientScope
+    };
+
+    if (!chatId) {
+        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, tokenObj);
+        if (newChatResult.error) {
+            if (newChatResult.status === 401 || newChatResult.status === 429) {
+                return handleApiError(newChatResult, tokenObj, retryContext);
+            }
+            return { error: 'Не удалось создать чат: ' + newChatResult.error };
+        }
+        chatId = newChatResult.chatId;
+        retryContext.chatId = chatId;
+        logInfo(`Создан новый чат v2 с ID: ${chatId}`);
+    }
+
     let page = null;
     try {
         page = await pagePool.getPage(browserContext);
@@ -871,13 +1295,6 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
         }
 
-        if (!authToken) {
-            logWarn('Токен отсутствует перед отправкой запроса');
-            authToken = await page.evaluate(() => localStorage.getItem('token'));
-            if (!authToken) return { error: 'Токен авторизации не найден. Требуется перезапуск в ручном режиме.', chatId };
-            saveAuthToken(authToken);
-        }
-
         logInfo('Отправка запроса к API v2...');
 
         const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size);
@@ -885,7 +1302,14 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         logDebug(`Отправка сообщения в чат ${chatId} с parent_id: ${parentId || 'null'}`);
 
         const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
-        const response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk);
+        const response = await executeApiRequest(
+            page,
+            apiUrl,
+            payload,
+            tokenObj.token,
+            onChunk,
+            getBrowserFetchCredentials(tokenObj.id)
+        );
 
         if (response.success && response.isTask) {
             logInfo('Обнаружен ответ с задачей (видеогенерация)');
@@ -900,6 +1324,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             }
 
             logInfo(`Task ID: ${taskId}`);
+            bindResourceToAccount('task', taskId, tokenObj.id, clientScope);
 
             if (!waitForCompletion) {
                 logInfo('Возвращаем task_id для клиентского polling');
@@ -919,7 +1344,14 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             }
 
             logInfo('Начинаем polling для получения видео...');
-            const taskResult = await pollTaskStatus(taskId, page, authToken);
+            const taskResult = await pollTaskStatus(
+                taskId,
+                page,
+                tokenObj.token,
+                TASK_POLL_MAX_ATTEMPTS,
+                TASK_POLL_INTERVAL,
+                getBrowserFetchCredentials(tokenObj.id)
+            );
 
             pagePool.releasePage(page);
             page = null;
@@ -956,6 +1388,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         if (response.success) {
             logRaw(JSON.stringify(response.data));
             logInfo('Ответ получен успешно');
+            bindResourceToAccount('chat', chatId, tokenObj.id);
             response.data.chatId = chatId;
             response.data.parentId = response.data.response_id;
             response.data.id = response.data.id || 'chatcmpl-' + Date.now();
@@ -968,7 +1401,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             return response.data;
         }
 
-        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+        return handleApiError(response, tokenObj, retryContext);
     } catch (error) {
         logError('Ошибка при отправке сообщения', error);
         return { error: error.toString(), chatId };
@@ -1029,19 +1462,35 @@ function extractVideoUrl(taskData) {
     return extractMediaUrl(taskData, 'video');
 }
 
-export async function pollQwenTaskStatus(taskId, waitForCompletion = false) {
+export async function pollQwenTaskStatus(taskId, waitForCompletion = false, clientScope = null) {
+    const boundAccountId = getResourceAccountId('task', taskId, clientScope);
+    if (!boundAccountId) {
+        return {
+            error: 'Неизвестен аккаунт Qwen-задачи. После перезапуска запустите генерацию заново.',
+            status: 404,
+            task_id: taskId
+        };
+    }
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Браузер не инициализирован', task_id: taskId };
-
-    const tokenObj = await resolveAuthToken(browserContext);
-    if (!tokenObj?.token) return { error: 'Ошибка авторизации: не удалось получить токен', task_id: taskId };
+    const tokenObj = await resolveAccountToken(boundAccountId, browserContext);
+    if (!tokenObj?.token) {
+        return { error: 'Аккаунт Qwen-задачи недоступен', status: 409, task_id: taskId };
+    }
 
     let page = null;
     try {
         page = await pagePool.getPage(browserContext);
         const result = waitForCompletion
-            ? await pollTaskStatus(taskId, page, tokenObj.token)
-            : await pollTaskStatus(taskId, page, tokenObj.token, 1, 0);
+            ? await pollTaskStatus(
+                taskId,
+                page,
+                tokenObj.token,
+                TASK_POLL_MAX_ATTEMPTS,
+                TASK_POLL_INTERVAL,
+                getBrowserFetchCredentials(tokenObj.id)
+            )
+            : await pollTaskStatus(taskId, page, tokenObj.token, 1, 0, getBrowserFetchCredentials(tokenObj.id));
 
         const mediaUrl = extractMediaUrl(result.data || result, 'video') || extractMediaUrl(result.data || result, 'image');
         return {
@@ -1064,7 +1513,7 @@ export async function clearPagePool() {
 }
 
 export function getAuthToken() {
-    return authToken;
+    return browserAuthToken;
 }
 
 // ─── createChatV2 ────────────────────────────────────────────────────────────
@@ -1073,29 +1522,28 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Браузер не инициализирован' };
 
-    const tokenObj = preferredTokenObj || await getAvailableToken();
-    if (tokenObj?.token) {
-        authToken = tokenObj.token;
-        logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);
-    }
-
-    if (!authToken) {
-        logInfo('Получение токена авторизации для создания чата...');
-        authToken = await extractAuthToken(browserContext);
-        if (!authToken) return { error: 'Не удалось получить токен авторизации' };
-    }
+    const preferredToken = snapshotAccountToken(preferredTokenObj);
+    const tokenObj = preferredToken || await resolveAuthToken(browserContext);
+    if (!tokenObj) return { error: 'Не удалось получить токен авторизации' };
+    logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);
 
     let page = null;
     try {
         page = await pagePool.getPage(browserContext);
 
         const payload = { title, models: [model], chat_mode: 'normal', chat_type: chatType, timestamp: Date.now() };
-        const requestBody = { apiUrl: CREATE_CHAT_URL, payload, headers: buildQwenRequestHeaders(authToken) };
+        const requestBody = {
+            apiUrl: CREATE_CHAT_URL,
+            payload,
+            headers: buildQwenRequestHeaders(tokenObj.token),
+            credentials: getBrowserFetchCredentials(tokenObj.id)
+        };
 
         const result = await page.evaluate(async (data) => {
             try {
                 const response = await fetch(data.apiUrl, {
                     method: 'POST',
+                    credentials: data.credentials,
                     headers: data.headers,
                     body: JSON.stringify(data.payload)
                 });
@@ -1109,9 +1557,44 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         pagePool.releasePage(page);
         page = null;
 
-        if (result.success && result.data.success) {
-            logInfo(`Чат создан: ${result.data.data.id}`);
-            return { success: true, chatId: result.data.data.id, requestId: result.data.request_id };
+        if (result.success && result.data?.success && result.data?.data?.id) {
+            const createdChatId = result.data.data.id;
+            bindResourceToAccount('chat', createdChatId, tokenObj.id);
+            logInfo(`Чат создан: ${createdChatId}`);
+            return {
+                success: true,
+                chatId: createdChatId,
+                requestId: result.data.request_id,
+                accountId: tokenObj.id
+            };
+        }
+
+        const structuredErrorBody = result.errorBody || (result.data ? JSON.stringify(result.data) : null);
+        const resultCode = result.data?.code || result.data?.data?.code;
+        const isUnauthorized = result.status === 401
+            || /Unauthorized|Token has expired/i.test(structuredErrorBody || '');
+        const isRateLimited = result.status === 429 || resultCode === 'RateLimited';
+        const effectiveStatus = isUnauthorized ? 401 : isRateLimited ? 429 : result.status;
+        if (isUnauthorized) markInvalidByToken(tokenObj.token);
+        if (isUnauthorized && (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token)) {
+            browserAuthToken = null;
+            setAuthenticationStatus(false);
+        }
+        if (isRateLimited) {
+            let hours = 24;
+            try {
+                const parsedHours = Number(JSON.parse(structuredErrorBody).num);
+                hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : 24;
+            } catch { /* non-JSON body */ }
+            markRateLimitedByToken(tokenObj.token, hours);
+            if (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token) {
+                markBrowserTokenRateLimited(tokenObj.token, hours);
+            }
+        }
+
+        if (!preferredToken && (isUnauthorized || isRateLimited) && retryCount < MAX_RETRY_COUNT && await canRetryWithAnotherAccount(tokenObj, browserContext)) {
+            logWarn('Создание чата не удалось из-за аккаунта; повторяем с другим доступным аккаунтом');
+            return createChatV2(model, title, retryCount + 1, chatType, null);
         }
 
         const isTransient = result.status >= 500 && result.status < 600;
@@ -1123,9 +1606,15 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
 
         const cleanError = isTransient
             ? `Qwen API недоступен (${result.status}). Повторите позже.`
-            : (result.errorBody || result.error || 'Неизвестная ошибка');
+            : (structuredErrorBody || result.error || 'Неизвестная ошибка');
         logError(`Ошибка при создании чата: ${result.status || 'unknown'} (попытка ${retryCount + 1})`);
-        return { error: cleanError };
+        return {
+            error: cleanError,
+            status: effectiveStatus,
+            statusText: result.statusText,
+            errorBody: structuredErrorBody,
+            accountId: tokenObj.id
+        };
     } catch (error) {
         logError('Ошибка при создании чата', error);
         return { error: error.toString() };
@@ -1152,6 +1641,7 @@ export async function testToken(token) {
         const requestBody = {
             apiUrl: CHAT_API_URL,
             headers: buildQwenRequestHeaders(token),
+            credentials: 'omit',
             payload: { chat_type: 't2t', messages: [{ role: 'user', content: 'ping', chat_type: 't2t' }], model: DEFAULT_MODEL, stream: false }
         };
 
@@ -1159,6 +1649,7 @@ export async function testToken(token) {
             try {
                 const res = await fetch(data.apiUrl, {
                     method: 'POST',
+                    credentials: data.credentials,
                     headers: data.headers,
                     body: JSON.stringify(data.payload)
                 });

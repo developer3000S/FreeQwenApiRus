@@ -33,8 +33,37 @@ export function createChat(chatName) {
     return chatId;
 }
 
+/**
+ * Sanitize chatId to prevent path traversal (CWE-22).
+ * Rejects any value containing path separators, traversal sequences,
+ * or characters outside the allowed set [a-zA-Z0-9_-].
+ * Returns null for invalid values — callers must handle null gracefully.
+ */
+export function sanitizeChatId(chatId) {
+    if (typeof chatId !== 'string' || !chatId) return null;
+    // Reject if it contains path separators or traversal sequences
+    if (chatId.includes('/') || chatId.includes('\\') || chatId.includes('..')) return null;
+    // Whitelist: only allow alphanumeric, hyphens, and underscores
+    if (!/^[a-zA-Z0-9_-]+$/.test(chatId)) return null;
+    return chatId;
+}
+
+export function resolveHistoryFilePath(historyDir, chatId) {
+    const safeChatId = sanitizeChatId(chatId);
+    if (!safeChatId) {
+        throw new Error(`Invalid chatId: ${String(chatId).substring(0, 50)}`);
+    }
+    const resolvedHistoryDir = path.resolve(historyDir);
+    const resolved = path.resolve(resolvedHistoryDir, `${safeChatId}.json`);
+    // Defense-in-depth: verify the resolved path is still inside HISTORY_DIR
+    if (!resolved.startsWith(resolvedHistoryDir + path.sep)) {
+        throw new Error(`Path traversal blocked for chatId: ${String(chatId).substring(0, 50)}`);
+    }
+    return resolved;
+}
+
 function getHistoryFilePath(chatId) {
-    return path.join(HISTORY_DIR, `${chatId}.json`);
+    return resolveHistoryFilePath(HISTORY_DIR, chatId);
 }
 
 export function saveHistory(chatId, data) {
@@ -120,10 +149,15 @@ export function loadHistory(chatId) {
 }
 
 export function chatExists(chatId) {
-    const historyFilePath = getHistoryFilePath(chatId);
-    const exists = fs.existsSync(historyFilePath);
-    logDebug(`Проверка существования чата ${chatId}: ${exists ? 'найден' : 'не найден'}`);
-    return exists;
+    try {
+        const historyFilePath = getHistoryFilePath(chatId);
+        const exists = fs.existsSync(historyFilePath);
+        logDebug(`Проверка существования чата ${chatId}: ${exists ? 'найден' : 'не найден'}`);
+        return exists;
+    } catch (error) {
+        logError(`Invalid chatId in chatExists: ${error.message}`);
+        return false;
+    }
 }
 
 export function renameChat(chatId, newName) {
@@ -341,4 +375,4 @@ export function deleteChatsAutomatically(criteria = {}) {
             error: error.message
         };
     }
-} 
+}

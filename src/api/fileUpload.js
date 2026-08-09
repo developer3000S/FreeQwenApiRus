@@ -1,10 +1,9 @@
 import { getBrowserContext } from '../browser/browser.js';
 import { logInfo, logError } from '../logger/index.js';
-import { getAuthToken, extractAuthToken, pagePool } from './chat.js';
-import { getAvailableToken } from './tokenManager.js';
+import { bindResourceToAccount, getBrowserFetchCredentials, pagePool, selectRequestAccount } from './chat.js';
 import fs from 'fs';
 import path from 'path';
-import { STS_TOKEN_API_URL, OSS_SDK_URL, UPLOADS_DIR } from '../config.js';
+import { STS_TOKEN_API_URL, OSS_SDK_URL } from '../config.js';
 
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
 const DOCUMENT_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt'];
@@ -18,25 +17,25 @@ function validateBrowserContext() {
     return browserContext;
 }
 
-async function validateAuthToken(browserContext) {
-    const tokenObj = await getAvailableToken();
-    if (tokenObj?.token) {
-        logInfo(`Используется токен из tokenManager: ${tokenObj.id}`);
-        return tokenObj.token;
-    }
-
-    let token = getAuthToken();
-    if (!token) {
-        logInfo('Токен авторизации не найден в памяти, пытаемся извлечь из браузера');
-        token = await extractAuthToken(browserContext);
-        if (!token) throw new Error('Не удалось получить токен авторизации');
-    }
-    return token;
+async function validateAuthAccount(browserContext) {
+    const account = await selectRequestAccount(browserContext);
+    if (!account?.id || !account?.token) throw new Error('Не удалось получить токен авторизации');
+    logInfo(`Используется аккаунт для загрузки файла: ${account.id}`);
+    return Object.freeze({ id: account.id, token: account.token });
 }
 
-export async function getStsToken(fileInfo) {
+function bindStsResources(stsData, accountId, clientScope) {
+    for (const key of ['file_id', 'file_path', 'file_url', 'url']) {
+        const resourceId = stsData?.[key];
+        if (typeof resourceId === 'string' && resourceId.trim()) {
+            bindResourceToAccount('file', resourceId, accountId, clientScope);
+        }
+    }
+}
+
+export async function getStsToken(fileInfo, clientScope = null) {
     const browserContext = validateBrowserContext();
-    const token = await validateAuthToken(browserContext);
+    const account = await validateAuthAccount(browserContext);
     logInfo(`Запрос STS токена для файла: ${fileInfo.filename}`);
 
     let page = null;
@@ -46,15 +45,22 @@ export async function getStsToken(fileInfo) {
             try {
                 const response = await fetch(data.apiUrl, {
                     method: 'POST',
+                    credentials: data.credentials,
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.token}`, 'Accept': 'application/json' },
                     body: JSON.stringify(data.fileInfo)
                 });
                 if (response.ok) return { success: true, data: await response.json() };
                 return { success: false, status: response.status, statusText: response.statusText, errorBody: await response.text() };
             } catch (error) { return { success: false, error: error.toString() }; }
-        }, { apiUrl: STS_TOKEN_API_URL, token, fileInfo });
+        }, {
+            apiUrl: STS_TOKEN_API_URL,
+            token: account.token,
+            credentials: getBrowserFetchCredentials(account.id),
+            fileInfo
+        });
 
         if (result.success) {
+            bindStsResources(result.data, account.id, clientScope);
             logInfo(`STS токен успешно получен для файла: ${fileInfo.filename}`);
             return result.data;
         }
@@ -130,7 +136,7 @@ export async function uploadFile(filePath, stsData) {
     }
 }
 
-export async function uploadFileToQwen(filePath) {
+export async function uploadFileToQwen(filePath, clientScope = null) {
     try {
         if (!fs.existsSync(filePath)) throw new Error(`Файл не найден: ${filePath}`);
 
@@ -143,7 +149,7 @@ export async function uploadFileToQwen(filePath) {
         else if (DOCUMENT_EXTENSIONS.includes(fileExt)) fileType = DOCUMENT_FILE_TYPE;
 
         const fileInfo = { filename: fileName, filesize: fileSize, filetype: fileType };
-        const stsData = await getStsToken(fileInfo);
+        const stsData = await getStsToken(fileInfo, clientScope);
         const uploadResult = await uploadFile(filePath, stsData);
         return { ...uploadResult, fileInfo, stsData };
     } catch (error) {
