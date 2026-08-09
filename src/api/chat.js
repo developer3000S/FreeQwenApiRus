@@ -23,7 +23,8 @@ import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
     PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
-    TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL
+    TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
+    BROWSER_FETCH_TIMEOUT, BROWSER_FETCH_IDLE_TIMEOUT, PROTOCOL_TIMEOUT
 } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -212,7 +213,7 @@ export const pagePool = {
                     logWarn('Страница из пула закрыта, пропускаем');
                     continue;
                 }
-                await page.evaluate(() => document.readyState);
+await evaluateWithProtocolGuard(page, () => document.readyState);
                 return page;
             } catch (e) {
                 logWarn(`Страница из пула протухла (${e.message?.substring(0, 60)}), создаём новую`);
@@ -227,7 +228,7 @@ export const pagePool = {
 
         if (!browserAuthToken) {
             try {
-                browserAuthToken = await newPage.evaluate(() => localStorage.getItem('token'));
+browserAuthToken = await evaluateWithProtocolGuard(newPage, () => localStorage.getItem('token'));
                 logInfo('Токен авторизации получен из браузера');
                 if (browserAuthToken) {
                     saveAuthToken(browserAuthToken);
@@ -279,7 +280,7 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
         try {
             const statusUrl = `${TASK_STATUS_URL}/${taskId}`;
 
-            const result = await page.evaluate(async (data) => {
+const result = await evaluateWithProtocolGuard(page, async (data) => {
                 try {
                     const response = await fetch(data.url, {
                         method: 'GET',
@@ -341,7 +342,7 @@ export async function extractAuthToken(context, forceRefresh = false) {
             await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
             await delay(RETRY_DELAY);
 
-            const newToken = await page.evaluate(async () => {
+const newToken = await evaluateWithProtocolGuard(page, async () => {
                 function findTokenInStorage(storage) {
                     const directKeys = ['token', 'auth_token', 'access_token', 'id_token', 'qwen_token'];
                     for (const key of directKeys) {
@@ -712,6 +713,75 @@ export function isQwenAntiBotBody(body) {
         lower.includes('purecaptcha');
 }
 
+export function isProtocolTimeoutError(error) {
+    const message = error?.message || String(error || '');
+    return /Runtime\.callFunctionOn timed out|protocolTimeout|Increase the 'protocolTimeout'|page\.evaluate timed out/i.test(message);
+}
+
+function getBrowserFetchTimeoutMs() {
+    const configured = Number(BROWSER_FETCH_TIMEOUT);
+    const overall = Number.isFinite(configured) && configured > 0 ? configured : 300_000;
+    // Keep a safety margin under PROTOCOL_TIMEOUT so evaluate can return before CDP kills it.
+    const protocolLimit = Number(PROTOCOL_TIMEOUT);
+    if (Number.isFinite(protocolLimit) && protocolLimit > 5_000) {
+        return Math.min(overall, Math.max(5_000, protocolLimit - 30_000));
+    }
+    return overall;
+}
+
+function getBrowserFetchIdleTimeoutMs() {
+    const configured = Number(BROWSER_FETCH_IDLE_TIMEOUT);
+    if (!Number.isFinite(configured) || configured <= 0) return 120_000;
+    return configured;
+}
+
+async function discardBrokenPage(page) {
+    if (!page) return;
+    try {
+        if (typeof page.isClosed === 'function' && page.isClosed()) return;
+    } catch {
+        return;
+    }
+
+    const baseContext = getBrowserContext();
+    if (page === baseContext) {
+        try {
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+        } catch (error) {
+            logWarn(`Не удалось перезагрузить базовую страницу после таймаута: ${error.message}`);
+        }
+        return;
+    }
+
+    try {
+        await page.close();
+    } catch (error) {
+        logWarn(`Не удалось закрыть зависшую страницу: ${error.message}`);
+    }
+}
+
+/**
+ * page.evaluate wrapper that converts CDP protocol timeouts into structured
+ * API errors and discards the stuck page so the pool does not reuse it.
+ */
+export async function evaluateWithProtocolGuard(page, pageFn, arg) {
+    try {
+        return await page.evaluate(pageFn, arg);
+    } catch (error) {
+        if (isProtocolTimeoutError(error)) {
+            logError('page.evaluate превысил protocolTimeout/CDP лимит', error);
+            await discardBrokenPage(page);
+            return {
+                success: false,
+                status: 408,
+                protocolTimeout: true,
+                error: 'Browser request timed out (Runtime.callFunctionOn / protocolTimeout). Страница сброшена; повторите запрос.'
+            };
+        }
+        throw error;
+    }
+}
+
 function parseNonSseCompletionBody(body) {
     if (isQwenAntiBotBody(body)) {
         return { success: false, antiBot: true, error: 'Qwen anti-bot challenge returned for Node fetch', errorBody: body };
@@ -748,17 +818,43 @@ function parseNonSseCompletionBody(body) {
 }
 
 async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk) {
+    const controller = new AbortController();
+    const overallTimeoutMs = getBrowserFetchTimeoutMs();
+    const idleTimeoutMs = getBrowserFetchIdleTimeoutMs();
+    let overallTimer = null;
+    let idleTimer = null;
+
+    const clearTimers = () => {
+        if (overallTimer) clearTimeout(overallTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+        overallTimer = null;
+        idleTimer = null;
+    };
+
+    const armIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+            controller.abort(new Error(`Node fetch idle timeout after ${idleTimeoutMs}ms`));
+        }, idleTimeoutMs);
+    };
+
     try {
         if (!token) return { success: false, error: 'Токен авторизации не найден' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
 
         const requestUrl = buildQwenCompletionUrl(apiUrl, payload?.chat_id);
+        overallTimer = setTimeout(() => {
+            controller.abort(new Error(`Node fetch timed out after ${overallTimeoutMs}ms`));
+        }, overallTimeoutMs);
+        armIdleTimer();
 
         const response = await fetch(requestUrl, {
             method: 'POST',
             headers: buildQwenRequestHeaders(token),
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: controller.signal
         });
+        armIdleTimer();
 
         if (!response.ok) {
             const errorBody = await response.text();
@@ -803,6 +899,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         while (!finished) {
             const { done, value } = await reader.read();
             if (done) break;
+            armIdleTimer();
 
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
@@ -875,7 +972,15 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
             }
         };
     } catch (error) {
-        return { success: false, error: error.toString() };
+        const message = error?.message || error?.toString?.() || String(error);
+        const timedOut = controller.signal.aborted || /aborted|timeout/i.test(message);
+        return {
+            success: false,
+            status: timedOut ? 408 : undefined,
+            error: timedOut ? `Node fetch timed out: ${message}` : message
+        };
+    } finally {
+        clearTimers();
     }
 }
 
@@ -901,24 +1006,53 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, c
         logWarn(`Node-streaming недоступен (${streamedResponse.error || 'unknown error'}), fallback к browser fetch.`);
     }
 
+const browserTimeoutMs = getBrowserFetchTimeoutMs();
+    const browserIdleTimeoutMs = getBrowserFetchIdleTimeoutMs();
+
     const requestBody = {
         apiUrl: buildQwenCompletionUrl(apiUrl, payload?.chat_id),
         payload,
         headers: buildQwenRequestHeaders(token),
-        credentials
+        credentials,
+        timeoutMs: browserTimeoutMs,
+        idleTimeoutMs: browserIdleTimeoutMs
     };
 
     logDebug(`Используем токен: ${token ? 'Токен существует' : 'Токен отсутствует'}`);
     logDebug(`API URL: ${apiUrl}`);
 
-    return page.evaluate(async (data) => {
+    return evaluateWithProtocolGuard(page, async (data) => {
+        const controller = new AbortController();
+        let overallTimer = null;
+        let idleTimer = null;
+
+        const clearTimers = () => {
+            if (overallTimer) clearTimeout(overallTimer);
+            if (idleTimer) clearTimeout(idleTimer);
+            overallTimer = null;
+            idleTimer = null;
+        };
+
+        const armIdleTimer = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+                controller.abort(new Error(`Browser fetch idle timeout after ${data.idleTimeoutMs}ms`));
+            }, data.idleTimeoutMs);
+        };
+
         try {
             const response = await fetch(data.apiUrl, {
                 method: 'POST',
                 credentials: data.credentials,
                 headers: data.headers,
-                body: JSON.stringify(data.payload)
+                body: JSON.stringify(data.payload),
+                signal: controller.signal
             });
+            armIdleTimer();
+
+            overallTimer = setTimeout(() => {
+                controller.abort(new Error(`Browser fetch timed out after ${data.timeoutMs}ms`));
+            }, data.timeoutMs);
 
             if (response.ok) {
                 if (data.payload.stream === false) {
@@ -965,7 +1099,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, c
                     return { success: false, error: 'Unexpected non-SSE 200 response', errorBody: body };
                 }
 
-                const reader = response.body.getReader();
+const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
                 let fullContent = '';
@@ -977,6 +1111,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, c
                 while (!finished) {
                     const { done, value } = await reader.read();
                     if (done) break;
+                    armIdleTimer();
                     buffer += decoder.decode(value, { stream: true });
                     const lines = buffer.split('\n');
                     buffer = lines.pop() || '';
@@ -1029,10 +1164,17 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, c
                 };
             }
 
-            const errorBody = await response.text();
+const errorBody = await response.text();
             return { success: false, status: response.status, statusText: response.statusText, errorBody };
         } catch (error) {
-            return { success: false, error: error.toString() };
+            const timedOut = controller.signal.aborted || /timeout|aborted/i.test(String(error?.message || error));
+            return {
+                success: false,
+                status: timedOut ? 408 : undefined,
+                error: timedOut ? `Browser fetch timed out: ${error?.message || error}` : error.toString()
+            };
+        } finally {
+            clearTimers();
         }
     }, requestBody);
 }
@@ -1401,9 +1543,17 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             return response.data;
         }
 
-        return handleApiError(response, tokenObj, retryContext);
+return handleApiError(response, tokenObj, retryContext);
     } catch (error) {
         logError('Ошибка при отправке сообщения', error);
+        if (isProtocolTimeoutError(error)) {
+            return {
+                error: 'Запрос к браузеру превысил таймаут (protocolTimeout). Страница перезагружена; повторите запрос.',
+                status: 408,
+                protocolTimeout: true,
+                chatId
+            };
+        }
         return { error: error.toString(), chatId };
     } finally {
         if (page) {
@@ -1539,7 +1689,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
             credentials: getBrowserFetchCredentials(tokenObj.id)
         };
 
-        const result = await page.evaluate(async (data) => {
+const result = await evaluateWithProtocolGuard(page, async (data) => {
             try {
                 const response = await fetch(data.apiUrl, {
                     method: 'POST',
@@ -1645,7 +1795,7 @@ export async function testToken(token) {
             payload: { chat_type: 't2t', messages: [{ role: 'user', content: 'ping', chat_type: 't2t' }], model: DEFAULT_MODEL, stream: false }
         };
 
-        const result = await page.evaluate(async (data) => {
+const result = await evaluateWithProtocolGuard(page, async (data) => {
             try {
                 const res = await fetch(data.apiUrl, {
                     method: 'POST',

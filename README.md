@@ -68,6 +68,13 @@ cp .env.example .env
 - `QWEN_USE_NODE_FETCH=0` — оставляет запросы внутри browser `page.evaluate(fetch)`, что обычно лучше проходит Qwen anti-bot. Для отладки можно поставить `1`: ошибки anti-bot возвращаются быстрее и меньше Puppeteer-зависаний, но Node-side запросы чаще получают captcha.
 - `NON_INTERACTIVE=1` и `SKIP_ACCOUNT_MENU=1` — запуск без меню аккаунтов для локальных агентов/демонов.
 
+Таймауты браузера (помогают против `Runtime.callFunctionOn timed out` / `protocolTimeout`):
+
+- `PROTOCOL_TIMEOUT=600000` — лимит CDP-протокола Puppeteer (мс). Должен быть **строго выше** `BROWSER_FETCH_TIMEOUT`, чтобы in-page `fetch` успевал завершиться по `AbortController` до того, как CDP убьёт `page.evaluate`.
+- `BROWSER_FETCH_TIMEOUT=300000` — общий таймаут in-page `fetch` (мс). Автоматически ограничивается `PROTOCOL_TIMEOUT - 30000` для безопасного запаса перед CDP-лимитом.
+- `BROWSER_FETCH_IDLE_TIMEOUT=120000` — таймаут простоя между SSE-чанками (мс). Если сервер перестал присылать данные, запрос прерывается и страница перезагружается.
+- `QWEN_USE_NODE_FETCH=0` — когда `0`, запросы идут через browser `page.evaluate(fetch)` с новыми `AbortController`-таймаутами. При `1` используется Node-side стриминг с теми же таймаутами и структурной ошибкой `{ status: 408, protocolTimeout: true }` вместо сырого `ProtocolError`.
+
 Полный список параметров с комментариями — в `.env.example`.
 
 ## Авторизация Qwen Chat

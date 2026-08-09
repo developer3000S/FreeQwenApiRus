@@ -1,9 +1,25 @@
 import { getBrowserContext } from '../browser/browser.js';
 import { logInfo, logError } from '../logger/index.js';
-import { bindResourceToAccount, getBrowserFetchCredentials, pagePool, selectRequestAccount } from './chat.js';
+import { bindResourceToAccount, getBrowserFetchCredentials, pagePool, selectRequestAccount, evaluateWithProtocolGuard } from './chat.js';
 import fs from 'fs';
 import path from 'path';
-import { STS_TOKEN_API_URL, OSS_SDK_URL } from '../config.js';
+import { STS_TOKEN_API_URL, OSS_SDK_URL, BROWSER_FETCH_TIMEOUT, BROWSER_FETCH_IDLE_TIMEOUT, PROTOCOL_TIMEOUT } from '../config.js';
+
+function getBrowserFetchTimeoutMs() {
+    const configured = Number(BROWSER_FETCH_TIMEOUT);
+    const overall = Number.isFinite(configured) && configured > 0 ? configured : 300_000;
+    const protocolLimit = Number(PROTOCOL_TIMEOUT);
+    if (Number.isFinite(protocolLimit) && protocolLimit > 5_000) {
+        return Math.min(overall, Math.max(5_000, protocolLimit - 30_000));
+    }
+    return overall;
+}
+
+function getBrowserFetchIdleTimeoutMs() {
+    const configured = Number(BROWSER_FETCH_IDLE_TIMEOUT);
+    if (!Number.isFinite(configured) || configured <= 0) return 120_000;
+    return configured;
+}
 
 const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
 const DOCUMENT_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt'];
@@ -40,23 +56,33 @@ export async function getStsToken(fileInfo, clientScope = null) {
 
     let page = null;
     try {
-        page = await pagePool.getPage(browserContext);
-        const result = await page.evaluate(async (data) => {
+page = await pagePool.getPage(browserContext);
+        const stsTimeoutMs = getBrowserFetchTimeoutMs();
+        const result = await evaluateWithProtocolGuard(page, async (data) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(new Error(`STS fetch timed out after ${data.timeoutMs}ms`)), data.timeoutMs);
             try {
                 const response = await fetch(data.apiUrl, {
                     method: 'POST',
                     credentials: data.credentials,
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.token}`, 'Accept': 'application/json' },
-                    body: JSON.stringify(data.fileInfo)
+                    body: JSON.stringify(data.fileInfo),
+                    signal: controller.signal
                 });
                 if (response.ok) return { success: true, data: await response.json() };
                 return { success: false, status: response.status, statusText: response.statusText, errorBody: await response.text() };
-            } catch (error) { return { success: false, error: error.toString() }; }
+            } catch (error) {
+                const message = error?.message || String(error);
+                return { success: false, error: /timeout|aborted/i.test(message) ? `STS request timed out: ${message}` : message };
+            } finally {
+                clearTimeout(timer);
+            }
         }, {
             apiUrl: STS_TOKEN_API_URL,
             token: account.token,
             credentials: getBrowserFetchCredentials(account.id),
-            fileInfo
+            fileInfo,
+            timeoutMs: stsTimeoutMs
         });
 
         if (result.success) {
@@ -93,8 +119,11 @@ export async function uploadFile(filePath, stsData) {
 
     let page = null;
     try {
-        page = await pagePool.getPage(browserContext);
-        const result = await page.evaluate(async (data) => {
+page = await pagePool.getPage(browserContext);
+        const uploadTimeoutMs = getBrowserFetchTimeoutMs();
+        const result = await evaluateWithProtocolGuard(page, async (data) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(new Error(`OSS upload timed out after ${data.timeoutMs}ms`)), data.timeoutMs);
             try {
                 if (typeof window.OSS === 'undefined') {
                     await new Promise((resolve, reject) => {
@@ -114,12 +143,18 @@ export async function uploadFile(filePath, stsData) {
                     bucket: data.stsData.bucketname,
                     secure: true
                 });
-                await client.put(data.stsData.file_path, blob);
+                await client.put(data.stsData.file_path, blob, { signal: controller.signal });
                 return { success: true };
-            } catch (error) { return { success: false, error: error.toString() }; }
+            } catch (error) {
+                const message = error?.message || String(error);
+                return { success: false, error: /timeout|aborted/i.test(message) ? `OSS upload timed out: ${message}` : message };
+            } finally {
+                clearTimeout(timer);
+            }
         }, {
             fileBase64,
             ossSdkUrl: OSS_SDK_URL,
+            timeoutMs: uploadTimeoutMs,
             stsData: { region: stsData.region, bucketname: stsData.bucketname, file_path: stsData.file_path, access_key_id: stsData.access_key_id, access_key_secret: stsData.access_key_secret, security_token: stsData.security_token }
         });
 
