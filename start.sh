@@ -32,13 +32,13 @@ if [ ! -d "node_modules" ]; then
 fi
 
 # 3. Запуск системы
+echo "В другом терминале:";
+echo "npm run smoke";
+    
+echo "Если всё хорошо, API доступен здесь:";
+echo "http://localhost:3264/api"
+
 echo "Запуск FreQwenAPI ..."
 # npm run auth
 npm run models:sync
 SKIP_ACCOUNT_MENU=true npm start
-
-echo "В другом терминале:";
-echo "npm run smoke";
-
-echo "Если всё хорошо, API доступен здесь:";
-echo "http://localhost:3264/api"
