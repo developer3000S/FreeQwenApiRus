@@ -1,0 +1,17 @@
+# Фрагмент настройки custom provider для Hermes Agent
+# Добавьте этот блок в ~/.hermes/config.yaml и перезапустите Hermes.
+
+custom_providers:
+  - name: qwen-free
+    base_url: http://localhost:3264/api
+    model: qwen3.7-max
+    api_key: dummy-key
+
+# Запуск:
+# hermes chat --provider custom:qwen-free --model qwen3.7-max
+#
+# Проверка tools/skills:
+# hermes chat --provider custom:qwen-free --model qwen3.7-max \
+#   -q 'Как настроить Hermes Agent gateway для Telegram? Сначала используй нужный skill.'
+#
+# Ожидаемо: Hermes должен показать вызов skill_view, затем ответить по результату skill.
