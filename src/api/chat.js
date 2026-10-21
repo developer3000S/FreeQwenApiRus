@@ -282,10 +282,9 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
 
 const result = await evaluateWithProtocolGuard(page, async (data) => {
                 const controller = new AbortController();
-                const timeoutMs = getBrowserFetchTimeoutMs();
                 const overallTimer = setTimeout(() => {
-                    controller.abort(new Error(`Task-status fetch timed out after ${timeoutMs}ms`));
-                }, timeoutMs);
+                    controller.abort(new Error(`Task-status fetch timed out after ${data.timeoutMs}ms`));
+                }, data.timeoutMs);
                 try {
                     const response = await fetch(data.url, {
                         method: 'GET',
@@ -306,7 +305,7 @@ const result = await evaluateWithProtocolGuard(page, async (data) => {
                 } finally {
                     clearTimeout(overallTimer);
                 }
-            }, { url: statusUrl, token, credentials });
+            }, { url: statusUrl, token, credentials, timeoutMs: getBrowserFetchTimeoutMs() });
 
             if (!result.success) {
                 logWarn(`Ошибка при проверке статуса (попытка ${attempt}/${maxAttempts}): ${result.error}`);
@@ -1704,10 +1703,9 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
 
 const result = await evaluateWithProtocolGuard(page, async (data) => {
             const controller = new AbortController();
-            const timeoutMs = getBrowserFetchTimeoutMs();
             const overallTimer = setTimeout(() => {
-                controller.abort(new Error(`Create-chat fetch timed out after ${timeoutMs}ms`));
-            }, timeoutMs);
+                controller.abort(new Error(`Create-chat fetch timed out after ${data.timeoutMs}ms`));
+            }, data.timeoutMs);
             try {
                 const response = await fetch(data.apiUrl, {
                     method: 'POST',
